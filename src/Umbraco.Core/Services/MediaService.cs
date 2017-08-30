@@ -676,6 +676,118 @@ namespace Umbraco.Core.Services
             }
         }
 
+        // creating yet another cache, because media paths are too expensive to deal with
+        // but really, in v8 this should probably be managed at media cache (NuCache) level
+
+        private Dictionary<string, MediaIdent> _mediaPathCache;
+        private Dictionary<int, string> _mediaPathXCache;
+        private readonly object _mediaPathCacheLock = new object();
+
+        private class MediaIdent
+        {
+            public MediaIdent(IMedia media)
+            {
+                Id = media.Id;
+                Udi = media.GetUdi();
+            }
+
+            public int Id { get; private set; }
+            public GuidUdi Udi { get; private set; }
+        }
+
+        private void PopulateMediaPathCache()
+        {
+            var pageIndex = 0;
+            const int pageSize = 2000;
+            var count = 0;
+
+            while (true)
+            {
+                long unused;
+                var mediaPage = GetPagedDescendants(-1, pageIndex++, pageSize, out unused);
+
+                var pageCount = 0;
+                foreach (var media in mediaPage)
+                {
+                    var url = media.GetUrl("umbracoFile", Logger);
+                    _mediaPathCache[url] = new MediaIdent(media);
+                    _mediaPathXCache[media.Id] = url;
+                    pageCount++;
+                }
+                count += pageCount;
+
+                if (pageCount == 0) break;
+            }
+
+            Logger.Info<MediaService>("Cached " + count + " media paths.");
+        }
+
+        private void RegisterMediaPathCacheRefreshers()
+        {
+            Saved += (sender, args) =>
+            {
+                lock (_mediaPathCacheLock)
+                {
+                    foreach (var media in args.SavedEntities)
+                    {
+                        string url;
+                        if (_mediaPathXCache.TryGetValue(media.Id, out url))
+                            _mediaPathCache.Remove(url);
+                        url = media.GetUrl("umbracoFile", Logger);
+                        _mediaPathCache[url] = new MediaIdent(media);
+                        _mediaPathXCache[media.Id] = url;
+                    }
+                }
+            };
+
+            Deleted += (sender, args) =>
+            {
+                lock (_mediaPathCacheLock)
+                {
+                    foreach (var media in args.DeletedEntities)
+                    {
+                        string url;
+                        if (_mediaPathXCache.TryGetValue(media.Id, out url) == false) continue;
+                        _mediaPathXCache.Remove(media.Id);
+                        _mediaPathCache.Remove(url);
+                    }
+                }
+            };
+
+            // moved, trashed = should not change the path
+            // empty recycle bin = should be properly deleted (v8) but no
+
+            EmptiedRecycleBin += (sender, args) =>
+            {
+                lock (_mediaPathCacheLock)
+                {
+                    foreach (var id in args.Ids)
+                    {
+                        string url;
+                        if (_mediaPathXCache.TryGetValue(id, out url) == false) continue;
+                        _mediaPathXCache.Remove(id);
+                        _mediaPathCache.Remove(url);
+                    }
+                }
+            };
+        }
+
+        private IMedia GetMediaByPathFast(string mediaPath)
+        {
+            lock (_mediaPathCacheLock)
+            {
+                if (_mediaPathCache == null)
+                {
+                    _mediaPathCache = new Dictionary<string, MediaIdent>();
+                    _mediaPathXCache = new Dictionary<int, string>();
+                }
+                PopulateMediaPathCache();
+                RegisterMediaPathCacheRefreshers();
+            }
+            MediaIdent ident;
+            return _mediaPathCache.TryGetValue(mediaPath, out ident) ? GetById(ident.Id) : null;
+        }
+
         /// <summary>
         /// Gets an <see cref="IMedia"/> object from the path stored in the 'umbracoFile' property.
         /// </summary>
@@ -683,6 +795,9 @@ namespace Umbraco.Core.Services
         /// <returns><see cref="IMedia"/></returns>
         public IMedia GetMediaByPath(string mediaPath)
         {
+            // fixme - should this be enabled via an option?
+            return GetMediaByPathFast(mediaPath);
+
             var umbracoFileValue = mediaPath;
 
             const string Pattern = ".*[_][0-9]+[x][0-9]+[.].*";
